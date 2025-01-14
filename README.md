@@ -1,6 +1,6 @@
 You need:
-an Anthropic API key (env var `ANTHROPIC_API_KEY`)
-SerpAPI api key (env var `SERPAPI_API_KEY`)
+- an Anthropic API key (env var `ANTHROPIC_API_KEY`)
+- SerpAPI api key (env var `SERPAPI_API_KEY`)
 
 Usage:
 ```

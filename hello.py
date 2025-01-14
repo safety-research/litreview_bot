@@ -313,8 +313,7 @@ def main(args: CliArgs):
         summarization_sem = asyncio.Semaphore(10)
 
 
-        # class SummarizationOutcome(pydantic.BaseModel):
-
+        # This annoying part is needed for caching to work well
         class SummarizationResultWrapper(pydantic.BaseModel):
             res: SummarizationResult
             typ: Literal["success"] = "success"

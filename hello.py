@@ -8,7 +8,7 @@ import pathlib
 import pydantic
 import re
 from anthropic import AsyncAnthropic
-from miniperscache import cached_async, DefaultArgHasher
+from miniperscache import SqliteStorage, cached_async, DefaultArgHasher
 from miniperscache.serializer import Serializer
 from rich import print
 from tqdm import asyncio as tqdm_asyncio
@@ -79,19 +79,27 @@ async def _process_pdf_raw(
 
 
 @cached_async("search_scholar")
-async def search_scholar(query: str, num: int = 30) -> dict:
+async def search_scholar(query: str, offset: int = 0) -> dict:
     base = "https://serpapi.com/search"
     path_params = {
         "engine": "google_scholar",
         "q": query,
         "api_key": os.environ["SERPAPI_API_KEY"],
-        "num": num,
-    }
+        "num": 20
+    } | ({"start": offset} if offset > 0 else {})
     async with httpx.AsyncClient() as client:
         resp = await client.get(base, params=path_params)
         resp.raise_for_status()
         return resp.json()
-
+    
+async def search_scholar_many(query: str, num: int = 30) -> list[dict]:
+    results = []
+    while len(results) < num:
+        res = await search_scholar(query, len(results))
+        results.extend(res["organic_results"])
+        if len(results) >= num:
+            break
+    return results
 
 class ScholarResult(pydantic.BaseModel):
     title: str
@@ -264,14 +272,22 @@ def main(args: CliArgs):
     anth = AsyncAnthropic()
     instr_anth = instructor.from_anthropic(anth)
 
+    SqliteStorage().delete_with_tag("search_scholar")
+
     async def main():
-        res = await search_scholar(args.query)
-        search_results = list(process_scholar_results(res["organic_results"]))
+        res = await search_scholar_many(args.query, num=args.num_results)
+
+        try:
+            search_results = list(process_scholar_results(res))
+        except Exception as e:
+            print(f"Error processing scholar results: {e}")
+            print(res)
+            raise
 
         print(f"Num results fetched: {len(search_results)}")
 
         with_pdf_urls = [r for r in search_results if r.pdf_url is not None]
-        print(f"Num with PDFs: {len(with_pdf_urls)}")
+        print(f"Num with PDF URLs: {len(with_pdf_urls)}")
 
         sem = asyncio.Semaphore(5)
         filter_fn = mk_do_with_semaphore(sem, claude_filter_snippet)
@@ -291,23 +307,32 @@ def main(args: CliArgs):
 
         print(f"Num passed filter: {len(passed_filter)}")
 
-        async def fetch_pdf(url: str, name: str):
+        async def fetch_pdf(url: str, name: str) -> pathlib.Path | None:
             dest = pathlib.Path("pdfs") / name_to_path(name)
             if not dest.parent.exists():
                 dest.parent.mkdir(parents=True)
             if dest.exists():
                 return dest
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(url)
-                resp.raise_for_status()
-                dest.write_bytes(resp.content)
-            return dest
+            
+            try:
+                async with httpx.AsyncClient() as client:
+                    resp = await client.get(url)
+                    resp.raise_for_status()
+                    dest.write_bytes(resp.content)
+                return dest
+            except Exception as e:
+                print(f"Error fetching PDF {url}: {e}")
+                return None
 
         fetch_pdf_sem = mk_do_with_semaphore(sem, fetch_pdf)
 
-        pdf_paths: list[pathlib.Path] = await tqdm_asyncio.tqdm.gather(
+        pdf_paths: list[pathlib.Path | None] = await tqdm_asyncio.tqdm.gather(
             *[fetch_pdf_sem(assert_not_none(r.pdf_url), r.title) for r in passed_filter]
         )
+
+        papers_with_pdfs, pdf_paths = zip(*[(r, p) for (r, p) in zip(passed_filter, pdf_paths) if p is not None])
+
+        print(f"Num papers with downloaded PDFs: {len(papers_with_pdfs)}")
 
         # now, use Claude to summarize
         summarization_sem = asyncio.Semaphore(10)
@@ -361,14 +386,14 @@ def main(args: CliArgs):
             ]
         )
 
-        for doc, r in zip(passed_filter, summarization_results):
+        for doc, r in zip(papers_with_pdfs, summarization_results):
             if r.res.typ == "error":
                 print("")
                 print(f"Error summarizing {doc.title}: {r.res.res}")
 
         successful_summarization_results = [
             (doc, r.res.res)
-            for (doc, r) in zip(passed_filter, summarization_results)
+            for (doc, r) in zip(papers_with_pdfs, summarization_results)
             if r.res.typ == "success"
         ]
         successful_docs, successful_summaries = zip(*successful_summarization_results)
